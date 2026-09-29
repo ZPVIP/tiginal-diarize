@@ -97,7 +97,8 @@ fn absorb_small_clusters(raw: Vec<(i64, i64, i32)>) -> Vec<(i64, i64, i32)> {
         *spoken.entry(*id).or_default() += end - start;
     }
     let total: i64 = spoken.values().sum();
-    let floor = (total * 4 / 100).max(4000);
+    // Only absorb tiny noise glitches (< 500ms or < 1% of total speech)
+    let floor = (total / 100).max(500);
     reassign(raw, |id| spoken.get(id).is_some_and(|ms| *ms >= floor))
 }
 
