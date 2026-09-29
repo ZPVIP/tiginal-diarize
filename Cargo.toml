@@ -1,0 +1,18 @@
+[package]
+name = "tiginal-diarize"
+version = "0.1.0"
+edition = "2024"
+authors = ["pengzhang"]
+description = "Fast, local speaker diarization CLI based on NVIDIA Nemotron-3 Diarization"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+dirs = "6.0"
+hound = "3.5"
+ort = "2.0.0-rc.13"
+realfft = "3.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = "2.10"
