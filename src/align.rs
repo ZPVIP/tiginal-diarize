@@ -63,9 +63,20 @@ impl MmsAligner {
             return Ok(Vec::new());
         }
 
+        let duration_s = samples.len() as f64 / 16000.0;
+        // Wav2Vec2/MMS self-attention has O(N^2) memory complexity across 24 Transformer layers.
+        // Full unchunked inference on long audio (>60s) causes extreme memory explosion (tens of GBs)
+        // and CPU lockup. Safe single-pass limit is 60s; beyond that, use proportional alignment.
+        if duration_s > 60.0 {
+            if verbose {
+                eprintln!("[warn] Audio duration ({:.1}s) exceeds safe single-pass limit (60s) for MMS-Align; falling back to proportional alignment to avoid memory exhaustion.", duration_s);
+            }
+            return Ok(fallback_proportional_alignment(clean_text, duration_s));
+        }
+
         if verbose {
             eprintln!("[info] Running MMS-Align forward pass on {} samples ({:.2}s)...", 
-                samples.len(), samples.len() as f32 / 16000.0);
+                samples.len(), duration_s);
         }
 
         // 1. Prepare input tensor: [1, num_samples]
@@ -146,21 +157,24 @@ fn align_tokens_with_trellis(
         return Ok(fallback_proportional_alignment(transcript, num_frames as f64 * 0.02));
     }
 
-    // 2. Compute Log-Softmax in-place or row-by-row
-    // Trellis table: [num_frames, num_tokens]
-    // trellis[t][j] = log probability of reaching token j at frame t
+    // 2. Precompute Log-Sum-Exp once per frame: O(num_frames * vocab_size)
+    // Avoid re-scanning vocab_size in the O(num_frames * num_tokens) inner loop!
     let neg_inf = -1e9f32;
-    let mut trellis = vec![neg_inf; num_frames * num_tokens];
-
-    // Helper to get log_prob from logits: log_softmax(logits[t, token])
-    let get_log_prob = |t: usize, token_id: usize| -> f32 {
+    let mut log_sum_exps = Vec::with_capacity(num_frames);
+    for t in 0..num_frames {
         let row_start = t * vocab_size;
         let row = &logits[row_start..row_start + vocab_size];
         let max_val = row.iter().fold(neg_inf, |a, &b| a.max(b));
         let sum_exp: f32 = row.iter().map(|&x| (x - max_val).exp()).sum();
-        let log_sum_exp = max_val + sum_exp.ln();
-        row[token_id] - log_sum_exp
+        log_sum_exps.push(max_val + sum_exp.ln());
+    }
+
+    // Direct O(1) log_prob evaluation
+    let get_log_prob = |t: usize, token_id: usize| -> f32 {
+        logits[t * vocab_size + token_id] - log_sum_exps[t]
     };
+
+    let mut trellis = vec![neg_inf; num_frames * num_tokens];
 
     // Initialize t=0
     let first_token_id = target_tokens[0].2;
