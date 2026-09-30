@@ -19,6 +19,6 @@ ureq = "2.10"
 whisper-rs = { version = "0.16", optional = true }
 
 [features]
-default = []
+default = ["metal"]
 whisper = ["dep:whisper-rs"]
 metal = ["whisper", "whisper-rs?/metal"]

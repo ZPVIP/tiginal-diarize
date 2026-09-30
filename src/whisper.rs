@@ -49,6 +49,9 @@ impl WhisperTranscriber {
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
+        params.set_progress_callback_safe(|progress| {
+            eprintln!("[progress] whisper: {progress}");
+        });
 
         if let Some(ref lang) = self.language {
             if lang != "auto" {

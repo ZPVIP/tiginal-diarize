@@ -144,9 +144,9 @@ impl Model {
             input.extend_from_slice(chunk_embeds);
             cache.update(&self.config, &input, step_logits, chunk_steps);
 
-            if verbose && steps > 0 {
+            if steps > 0 {
                 let pct = (end * 100 / steps) as usize;
-                eprintln!("[progress] Diarization: {}% (step {}/{})", pct, end, steps);
+                eprintln!("[progress] diarization: {pct}");
             }
 
             start = end;
