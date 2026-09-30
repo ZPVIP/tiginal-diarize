@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["pengzhang"]
 description = "Fast, local speaker diarization CLI based on NVIDIA Nemotron-3 Diarization"
-license = "MIT"
+license = "GPL-3.0-or-later"
 readme = "README.md"
 
 [dependencies]
