@@ -45,7 +45,13 @@ impl WhisperTranscriber {
             .map_err(|e| format!("Failed to create Whisper state: {e}"))?;
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        params.set_n_threads(threads.min(16) as i32);
         params.set_token_timestamps(true);
+        params.set_split_on_word(true);
+        params.set_suppress_blank(true);
+        params.set_suppress_nst(true);
+        params.set_no_speech_thold(0.6);
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
@@ -66,49 +72,97 @@ impl WhisperTranscriber {
         state.full(params, samples)
             .map_err(|e| format!("Whisper transcription failed: {e}"))?;
 
-        let _num_segments = state.full_n_segments();
-
+        let eot = ctx.token_eot();
         let mut full_text = String::new();
         let mut aligned_words = Vec::new();
 
         let num_segments = state.full_n_segments();
         for s in 0..num_segments {
-            if let Some(seg) = state.get_segment(s) {
-                if let Ok(seg_text) = seg.to_str_lossy() {
-                    let trimmed = seg_text.trim();
-                    if !trimmed.is_empty() {
-                        if !full_text.is_empty() {
-                            full_text.push(' ');
-                        }
-                        full_text.push_str(trimmed);
+            let Some(seg) = state.get_segment(s) else {
+                continue;
+            };
+
+            let no_speech = seg.no_speech_probability();
+            if no_speech > 0.85 {
+                continue;
+            }
+
+            if let Ok(seg_text) = seg.to_str_lossy() {
+                let trimmed = seg_text.trim();
+                if !trimmed.is_empty() {
+                    if !full_text.is_empty() {
+                        full_text.push(' ');
                     }
+                    full_text.push_str(trimmed);
                 }
+            }
 
-                let num_tokens = seg.n_tokens();
-                for t in 0..num_tokens {
-                    if let Some(token) = seg.get_token(t) {
-                        let token_text = token.to_str_lossy().unwrap_or_default();
-                        let clean = token_text.trim();
-                        if clean.is_empty() || clean.starts_with("[_") {
-                            continue;
-                        }
-
-                        let data = token.token_data();
-                        let start_ms = data.t0 * 10;
-                        let end_ms = data.t1 * 10;
-
-                        aligned_words.push(AlignedWord {
-                            word: clean.to_string(),
+            let mut current: Option<(Vec<u8>, i64, i64, f32)> = None;
+            let flush = |current: &mut Option<(Vec<u8>, i64, i64, f32)>, words: &mut Vec<AlignedWord>| {
+                if let Some((bytes, start_ms, end_ms, score)) = current.take() {
+                    let text = String::from_utf8_lossy(&bytes).trim().to_owned();
+                    if !text.is_empty() && !text.starts_with("[_") {
+                        words.push(AlignedWord {
+                            word: text,
                             start: start_ms as f64 / 1000.0,
                             end: end_ms as f64 / 1000.0,
                             start_ms,
                             end_ms: end_ms.max(start_ms + 60),
                             speaker: 0,
-                            score: Some(token.token_probability()),
+                            score: Some(score),
                         });
                     }
                 }
+            };
+
+            let num_tokens = seg.n_tokens();
+            for t in 0..num_tokens {
+                let Some(token) = seg.get_token(t) else {
+                    continue;
+                };
+                if token.token_id() >= eot {
+                    continue;
+                }
+                let Ok(bytes) = token.to_bytes() else {
+                    continue;
+                };
+                let data = token.token_data();
+                let (t0, t1) = if data.t_dtw >= 0 {
+                    (data.t_dtw * 10, data.t_dtw * 10)
+                } else {
+                    (data.t0 * 10, data.t1 * 10)
+                };
+
+                let is_cjk_start = std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                    .map_or(false, crate::export::is_cjk);
+
+                let prev_incomplete = current
+                    .as_ref()
+                    .is_some_and(|(wb, _, _, _)| std::str::from_utf8(wb).is_err());
+
+                if prev_incomplete {
+                    if let Some((word_bytes, _, end, _)) = current.as_mut() {
+                        word_bytes.extend_from_slice(bytes);
+                        *end = t1.max(*end);
+                    }
+                } else if !bytes.starts_with(b" ") && !is_cjk_start {
+                    match current.as_mut() {
+                        Some((word_bytes, _, end, _)) => {
+                            word_bytes.extend_from_slice(bytes);
+                            *end = t1.max(*end);
+                        }
+                        None => {
+                            current = Some((bytes.to_vec(), t0, t1, token.token_probability()));
+                        }
+                    }
+                } else {
+                    flush(&mut current, &mut aligned_words);
+                    current = Some((bytes.to_vec(), t0, t1, token.token_probability()));
+                }
             }
+            flush(&mut current, &mut aligned_words);
         }
 
         Ok((full_text, aligned_words))

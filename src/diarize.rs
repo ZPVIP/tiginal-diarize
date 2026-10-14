@@ -148,3 +148,47 @@ fn renumber(mut raw: Vec<(i64, i64, i32)>) -> Vec<Turn> {
         })
         .collect()
 }
+
+/// The speaker of `start_ms..end_ms`: the one whose turns overlap it most, or
+/// the nearest turn when none do (whisper's words can fall in a gap).
+pub fn speaker_at(turns: &[Turn], start_ms: i64, end_ms: i64) -> usize {
+    if turns.is_empty() {
+        return 0;
+    }
+    let end_ms = end_ms.max(start_ms + 1);
+    let mut overlap = HashMap::<usize, i64>::new();
+    for turn in turns {
+        let shared = turn.end_ms.min(end_ms) - turn.start_ms.max(start_ms);
+        if shared > 0 {
+            *overlap.entry(turn.speaker).or_default() += shared;
+        }
+    }
+    if let Some((speaker, _)) = overlap
+        .into_iter()
+        .max_by_key(|(s, o)| (*o, usize::MAX - s))
+    {
+        return speaker;
+    }
+    let middle = (start_ms + end_ms) / 2;
+    turns
+        .iter()
+        .min_by_key(|t| {
+            if middle < t.start_ms {
+                t.start_ms - middle
+            } else if middle > t.end_ms {
+                middle - t.end_ms
+            } else {
+                0
+            }
+        })
+        .map_or(0, |t| t.speaker)
+}
+
+/// Where `speaker`'s turn starts near `around_ms`, within a second and a half.
+pub fn turn_start_near(turns: &[Turn], speaker: usize, around_ms: i64) -> Option<i64> {
+    turns
+        .iter()
+        .filter(|t| t.speaker == speaker && (t.start_ms - around_ms).abs() <= 1500)
+        .min_by_key(|t| (t.start_ms - around_ms).abs())
+        .map(|t| t.start_ms)
+}

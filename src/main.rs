@@ -66,6 +66,14 @@ struct Cli {
     #[arg(long = "write-artifacts")]
     write_artifacts: bool,
 
+    /// Skip speaker diarization (Nemotron-3)
+    #[arg(long = "no-diarize")]
+    no_diarize: bool,
+
+    /// Skip generating SRT subtitles
+    #[arg(long = "no-srt")]
+    no_srt: bool,
+
     /// Write output JSON to a file instead of stdout
     #[arg(short = 'o', long = "output", value_name = "FILE")]
     output: Option<PathBuf>,
@@ -84,13 +92,17 @@ fn main() -> ExitCode {
         eprintln!("[info] Target audio: {}", args.audio.display());
     }
 
-    // 1. Resolve Nemotron-3 model
-    let model_path = match model::resolve_model(args.model_path.as_deref(), args.download, args.verbose) {
-        Ok(path) => path,
-        Err(err) => {
-            eprintln!("[error] {err}");
-            return ExitCode::from(1);
+    // 1. Resolve Nemotron-3 model (only if diarization is enabled)
+    let model_path = if !args.no_diarize {
+        match model::resolve_model(args.model_path.as_deref(), args.download, args.verbose) {
+            Ok(path) => Some(path),
+            Err(err) => {
+                eprintln!("[error] {err}");
+                return ExitCode::from(1);
+            }
         }
+    } else {
+        None
     };
 
     // 2. Load and decode audio to 16kHz mono f32
@@ -113,12 +125,17 @@ fn main() -> ExitCode {
     }
 
     // 3. Run speaker diarization pipeline (Nemotron-3)
-    let turns = match diarize::turns(&samples, args.speakers, &model_path, args.verbose) {
-        Ok(t) => t,
-        Err(err) => {
-            eprintln!("[error] Diarization inference failed: {err}");
-            return ExitCode::from(3);
+    let turns = if !args.no_diarize {
+        let m_path = model_path.as_ref().unwrap();
+        match diarize::turns(&samples, args.speakers, m_path, args.verbose) {
+            Ok(t) => t,
+            Err(err) => {
+                eprintln!("[error] Diarization inference failed: {err}");
+                return ExitCode::from(3);
+            }
         }
+    } else {
+        Vec::new()
     };
 
     // 4. Handle Alignment or Local Whisper Transcription
@@ -182,24 +199,39 @@ fn main() -> ExitCode {
     // 5. Build output and write optional artifacts
     let json_output = if let Some(words) = aligned_words {
         let segments = export::match_words_to_turns(&words, &turns);
-        let diar_text = export::build_diarized_text(&segments);
-        let srt = export::build_srt_content(&segments);
+        let diar_text = if !args.no_diarize {
+            Some(export::build_diarized_text(&segments))
+        } else {
+            None
+        };
+        let srt = if !args.no_srt {
+            Some(export::build_srt_content(&segments, !args.no_diarize))
+        } else {
+            None
+        };
 
         if args.write_artifacts {
             let stem = args.audio.with_extension("");
-            let diar_path = PathBuf::from(format!("{}-diar.txt", stem.display()));
-            let srt_path = PathBuf::from(format!("{}.srt", stem.display()));
-
-            if let Err(e) = std::fs::write(&diar_path, &diar_text) {
-                eprintln!("[error] Failed to write {}: {e}", diar_path.display());
-            } else if args.verbose {
-                eprintln!("[info] Saved: {}", diar_path.display());
+            if !args.no_diarize {
+                if let Some(ref dt) = diar_text {
+                    let diar_path = PathBuf::from(format!("{}-diar.txt", stem.display()));
+                    if let Err(e) = std::fs::write(&diar_path, dt) {
+                        eprintln!("[error] Failed to write {}: {e}", diar_path.display());
+                    } else if args.verbose {
+                        eprintln!("[info] Saved: {}", diar_path.display());
+                    }
+                }
             }
 
-            if let Err(e) = std::fs::write(&srt_path, &srt) {
-                eprintln!("[error] Failed to write {}: {e}", srt_path.display());
-            } else if args.verbose {
-                eprintln!("[info] Saved: {}", srt_path.display());
+            if !args.no_srt {
+                if let Some(ref st) = srt {
+                    let srt_path = PathBuf::from(format!("{}.srt", stem.display()));
+                    if let Err(e) = std::fs::write(&srt_path, st) {
+                        eprintln!("[error] Failed to write {}: {e}", srt_path.display());
+                    } else if args.verbose {
+                        eprintln!("[info] Saved: {}", srt_path.display());
+                    }
+                }
             }
 
             if args.transcribe {
@@ -216,8 +248,8 @@ fn main() -> ExitCode {
             turns,
             transcript: transcript_text,
             segments: Some(segments),
-            diar_text: Some(diar_text),
-            srt: Some(srt),
+            diar_text,
+            srt,
         };
 
         serde_json::to_string_pretty(&full_output)

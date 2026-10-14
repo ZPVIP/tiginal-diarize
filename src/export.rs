@@ -79,7 +79,7 @@ pub fn build_diarized_text(segments: &[DiarizedSegment]) -> String {
 }
 
 /// Builds standard SRT content from segments.
-pub fn build_srt_content(segments: &[DiarizedSegment]) -> String {
+pub fn build_srt_content(segments: &[DiarizedSegment], include_speaker_tag: bool) -> String {
     let mut srt_blocks = Vec::new();
     let mut index = 1;
 
@@ -91,11 +91,16 @@ pub fn build_srt_content(segments: &[DiarizedSegment]) -> String {
 
         let start_str = format_srt_time(seg.start_ms);
         let end_str = format_srt_time(seg.end_ms.max(seg.start_ms + 100));
-        let speaker_tag = format!("[Speaker {}]", seg.speaker + 1);
+
+        let line = if include_speaker_tag {
+            format!("[Speaker {}] {}", seg.speaker + 1, trimmed)
+        } else {
+            trimmed.to_string()
+        };
 
         srt_blocks.push(format!(
-            "{}\n{} --> {}\n{} {}",
-            index, start_str, end_str, speaker_tag, trimmed
+            "{}\n{} --> {}\n{}",
+            index, start_str, end_str, line
         ));
         index += 1;
     }
@@ -103,7 +108,15 @@ pub fn build_srt_content(segments: &[DiarizedSegment]) -> String {
     srt_blocks.join("\n\n")
 }
 
-/// Assigns words to speaker turns using midpoint intersection.
+/// Whether `text` ends a sentence: a full stop, question or exclamation mark,
+/// possibly followed by a closing quote or bracket.
+pub fn ends_sentence(text: &str) -> bool {
+    text.trim_end()
+        .trim_end_matches(['"', '\'', ')', ']', '}', '”', '’', '）', '】'])
+        .ends_with(['.', '?', '!', '…', '。', '？', '！'])
+}
+
+/// Assigns words to speaker turns using sentence-level boundaries and maximum time overlap.
 pub fn match_words_to_turns(
     words: &[AlignedWord],
     turns: &[crate::diarize::Turn],
@@ -112,96 +125,107 @@ pub fn match_words_to_turns(
         return Vec::new();
     }
 
-    let mut words_with_speaker: Vec<AlignedWord> = Vec::with_capacity(words.len());
-
-    for w in words {
-        let mid = (w.start_ms + w.end_ms) / 2;
-        // Find turn containing mid point
-        let matched_turn = turns.iter().find(|t| mid >= t.start_ms && mid <= t.end_ms);
-        let speaker = if let Some(t) = matched_turn {
-            t.speaker
-        } else {
-            // Find closest turn
-            turns
-                .iter()
-                .min_by_key(|t| {
-                    if mid < t.start_ms {
-                        t.start_ms - mid
-                    } else if mid > t.end_ms {
-                        mid - t.end_ms
-                    } else {
-                        0
-                    }
-                })
-                .map(|t| t.speaker)
-                .unwrap_or(0)
-        };
-
-        let mut assigned = w.clone();
-        assigned.speaker = speaker;
-        words_with_speaker.push(assigned);
+    struct Phrase {
+        words: Vec<AlignedWord>,
+        start_ms: i64,
+        end_ms: i64,
     }
 
-    // Group adjacent words of same speaker into segments (and split on large pauses > 1.5s)
-    let mut segments = Vec::new();
-    let mut current_words: Vec<AlignedWord> = Vec::new();
+    // Step 1: Initial cuts at sentence ends, speaker changes at pauses (>= 250ms), or long silences (>= 3000ms).
+    // A run of continuous speech without pause is NEVER cut in the middle.
+    let mut pieces: Vec<Phrase> = Vec::new();
+    for w in words {
+        let sentence_ended = pieces.last().is_some_and(|p| {
+            p.words.last().is_some_and(|last| ends_sentence(&last.word))
+        });
+        let pause = pieces.last().map_or(0, |p| w.start_ms.saturating_sub(p.end_ms));
+        let long_pause = pause >= 3000;
+        let turn_at_pause = !turns.is_empty()
+            && pieces.last().is_some_and(|p| {
+                pause >= 250
+                    && crate::diarize::speaker_at(turns, p.start_ms, p.end_ms)
+                        != crate::diarize::speaker_at(turns, w.start_ms, w.end_ms)
+            });
 
-    for w in words_with_speaker {
-        if let Some(prev) = current_words.last() {
-            let pause = w.start_ms - prev.end_ms;
-            let speaker_changed = w.speaker != prev.speaker;
-            let long_pause = pause > 1500;
-
-            if speaker_changed || long_pause {
-                let start_ms = current_words.first().unwrap().start_ms;
-                let end_ms = current_words.last().unwrap().end_ms;
-                let spk = current_words.first().unwrap().speaker;
-                let text = join_words_cleanly(&current_words);
-
-                segments.push(DiarizedSegment {
-                    speaker: spk,
-                    speaker_label: format!("Speaker {}", spk + 1),
-                    start: start_ms as f64 / 1000.0,
-                    end: end_ms as f64 / 1000.0,
-                    start_ms,
-                    end_ms,
-                    text,
-                    words: std::mem::take(&mut current_words),
+        match pieces.last_mut() {
+            Some(p) if !sentence_ended && !turn_at_pause && !long_pause => {
+                p.end_ms = w.end_ms.max(p.end_ms);
+                p.words.push(w.clone());
+            }
+            _ => {
+                pieces.push(Phrase {
+                    start_ms: w.start_ms,
+                    end_ms: w.end_ms.max(w.start_ms + 60),
+                    words: vec![w.clone()],
                 });
             }
         }
-        current_words.push(w);
     }
 
-    if !current_words.is_empty() {
-        let start_ms = current_words.first().unwrap().start_ms;
-        let end_ms = current_words.last().unwrap().end_ms;
-        let spk = current_words.first().unwrap().speaker;
-        let text = join_words_cleanly(&current_words);
+    // Step 2: Sentence integrity protection:
+    // A sentence is NEVER split between speakers. If a piece stopped without a sentence-ending
+    // punctuation mark and the next piece follows within a normal pause (< 3000ms), join them.
+    let mut sentences: Vec<Phrase> = Vec::new();
+    for piece in pieces {
+        match sentences.last_mut() {
+            Some(previous)
+                if !ends_sentence(previous.words.last().map_or("", |w| &w.word))
+                    && piece.start_ms.saturating_sub(previous.end_ms) < 3000 =>
+            {
+                previous.end_ms = piece.end_ms.max(previous.end_ms);
+                previous.words.extend(piece.words);
+            }
+            _ => sentences.push(piece),
+        }
+    }
+    let pieces = sentences;
+
+    // Step 3: Assign speakers based on maximum time overlap over the whole sentence,
+    // align start time to takeover if speaker changed, and assemble into DiarizedSegments.
+    let mut segments: Vec<DiarizedSegment> = Vec::new();
+    for mut piece in pieces {
+        let speaker = crate::diarize::speaker_at(turns, piece.start_ms, piece.end_ms);
+        for w in &mut piece.words {
+            w.speaker = speaker;
+        }
+
+        let changed = segments.last().is_none_or(|last: &DiarizedSegment| last.speaker != speaker);
+        if changed {
+            if let Some(start) = crate::diarize::turn_start_near(turns, speaker, piece.start_ms) {
+                let floor = segments.last().map_or(0, |last| last.start_ms + 1);
+                piece.start_ms = start.max(floor);
+                piece.end_ms = piece.end_ms.max(piece.start_ms + 60);
+            }
+        }
+
+        let text = join_words_cleanly(&piece.words);
+        if text.trim().is_empty() {
+            continue;
+        }
 
         segments.push(DiarizedSegment {
-            speaker: spk,
-            speaker_label: format!("Speaker {}", spk + 1),
-            start: start_ms as f64 / 1000.0,
-            end: end_ms as f64 / 1000.0,
-            start_ms,
-            end_ms,
+            speaker,
+            speaker_label: format!("Speaker {}", speaker + 1),
+            start: piece.start_ms as f64 / 1000.0,
+            end: piece.end_ms as f64 / 1000.0,
+            start_ms: piece.start_ms,
+            end_ms: piece.end_ms,
             text,
-            words: current_words,
+            words: piece.words,
         });
     }
 
     segments
 }
 
-fn join_words_cleanly(words: &[AlignedWord]) -> String {
+pub fn join_words_cleanly(words: &[AlignedWord]) -> String {
     let mut text = String::new();
     for (i, w) in words.iter().enumerate() {
         let word = w.word.trim();
         if word.is_empty() {
             continue;
         }
-        if i == 0 {
+        if i == 0 || text.is_empty() {
             text.push_str(word);
         } else {
             // Check if CJK or English space is needed
@@ -219,7 +243,7 @@ fn join_words_cleanly(words: &[AlignedWord]) -> String {
     text
 }
 
-fn is_cjk(c: char) -> bool {
+pub fn is_cjk(c: char) -> bool {
     matches!(c,
         '\u{4E00}'..='\u{9FFF}' |
         '\u{3400}'..='\u{4DBF}' |
@@ -228,4 +252,191 @@ fn is_cjk(c: char) -> bool {
         '\u{30A0}'..='\u{30FF}' |
         '\u{AC00}'..='\u{D7AF}'
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diarize::Turn;
+
+    #[test]
+    fn test_ends_sentence() {
+        assert!(ends_sentence("Hello world."));
+        assert!(ends_sentence("Is this working?"));
+        assert!(ends_sentence("Yes!"));
+        assert!(ends_sentence("Wait..."));
+        assert!(ends_sentence("你好世界。"));
+        assert!(ends_sentence("真的吗？"));
+        assert!(ends_sentence(r#""Quote.""#));
+        assert!(!ends_sentence("Hello world"));
+        assert!(!ends_sentence("Good"));
+        assert!(!ends_sentence("So Hall"));
+    }
+
+    #[test]
+    fn test_sentence_not_split_across_speakers() {
+        // Simulates: "Good thing everyone speaks German."
+        // Where "Good" happened to overlap with speaker 1, but the rest of the sentence was speaker 0.
+        let words = vec![
+            AlignedWord {
+                word: "Good".to_string(),
+                start: 0.0,
+                end: 0.3,
+                start_ms: 0,
+                end_ms: 300,
+                speaker: 0,
+                score: None,
+            },
+            AlignedWord {
+                word: "thing".to_string(),
+                start: 0.35,
+                end: 0.6,
+                start_ms: 350,
+                end_ms: 600,
+                speaker: 0,
+                score: None,
+            },
+            AlignedWord {
+                word: "everyone".to_string(),
+                start: 0.65,
+                end: 1.0,
+                start_ms: 650,
+                end_ms: 1000,
+                speaker: 0,
+                score: None,
+            },
+            AlignedWord {
+                word: "speaks".to_string(),
+                start: 1.05,
+                end: 1.4,
+                start_ms: 1050,
+                end_ms: 1400,
+                speaker: 0,
+                score: None,
+            },
+            AlignedWord {
+                word: "German.".to_string(),
+                start: 1.45,
+                end: 1.9,
+                start_ms: 1450,
+                end_ms: 1900,
+                speaker: 0,
+                score: None,
+            },
+        ];
+
+        let turns = vec![
+            Turn {
+                speaker: 1,
+                start: 0.0,
+                end: 0.32,
+                start_ms: 0,
+                end_ms: 320,
+            },
+            Turn {
+                speaker: 0,
+                start: 0.32,
+                end: 2.0,
+                start_ms: 320,
+                end_ms: 2000,
+            },
+        ];
+
+        let segments = match_words_to_turns(&words, &turns);
+        // Sentence must NOT be split into Speaker 2: "Good" and Speaker 1: "thing everyone speaks German."
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].speaker, 0); // Majority overlap is Speaker 0
+        assert_eq!(segments[0].text, "Good thing everyone speaks German.");
+    }
+
+    #[test]
+    fn test_distinct_turns_with_pause_split_properly() {
+        let words = vec![
+            AlignedWord {
+                word: "Hello.".to_string(),
+                start: 0.0,
+                end: 0.5,
+                start_ms: 0,
+                end_ms: 500,
+                speaker: 0,
+                score: None,
+            },
+            AlignedWord {
+                word: "Hi there.".to_string(),
+                start: 1.0,
+                end: 1.6,
+                start_ms: 1000,
+                end_ms: 1600,
+                speaker: 0,
+                score: None,
+            },
+        ];
+
+        let turns = vec![
+            Turn {
+                speaker: 0,
+                start: 0.0,
+                end: 0.6,
+                start_ms: 0,
+                end_ms: 600,
+            },
+            Turn {
+                speaker: 1,
+                start: 0.9,
+                end: 1.7,
+                start_ms: 900,
+                end_ms: 1700,
+            },
+        ];
+
+        let segments = match_words_to_turns(&words, &turns);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].speaker, 0);
+        assert_eq!(segments[0].text, "Hello.");
+        assert_eq!(segments[1].speaker, 1);
+        assert_eq!(segments[1].text, "Hi there.");
+    }
+
+    #[test]
+    fn test_join_words_cleanly_punctuation() {
+        let words = vec![
+            AlignedWord {
+                word: "Here's".to_string(),
+                start: 0.0,
+                end: 0.4,
+                start_ms: 0,
+                end_ms: 400,
+                speaker: 0,
+                score: None,
+            },
+            AlignedWord {
+                word: "modalities,".to_string(),
+                start: 0.45,
+                end: 0.9,
+                start_ms: 450,
+                end_ms: 900,
+                speaker: 0,
+                score: None,
+            },
+            AlignedWord {
+                word: "loosening".to_string(),
+                start: 0.95,
+                end: 1.3,
+                start_ms: 950,
+                end_ms: 1300,
+                speaker: 0,
+                score: None,
+            },
+            AlignedWord {
+                word: "piezo.".to_string(),
+                start: 1.35,
+                end: 1.7,
+                start_ms: 1350,
+                end_ms: 1700,
+                speaker: 0,
+                score: None,
+            },
+        ];
+        assert_eq!(join_words_cleanly(&words), "Here's modalities, loosening piezo.");
+    }
 }
