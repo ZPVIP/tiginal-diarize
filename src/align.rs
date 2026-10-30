@@ -6,6 +6,28 @@ use ort::value::Tensor;
 
 use crate::export::AlignedWord;
 
+const SAMPLE_RATE: usize = 16_000;
+const INFERENCE_CHUNK_SAMPLES: usize = 30 * SAMPLE_RATE;
+const INFERENCE_OVERLAP_SAMPLES: usize = 2 * SAMPLE_RATE;
+const ALIGNMENT_BEAM_STATES: usize = 512;
+
+struct AcousticFrames {
+    logits: Vec<f32>,
+    times_ms: Vec<i64>,
+    vocab_size: usize,
+}
+
+#[derive(Clone, Copy)]
+struct TranscriptToken {
+    word_index: usize,
+    token_id: usize,
+}
+
+struct TraceFrame {
+    states: Vec<u32>,
+    previous_offsets: Vec<u8>,
+}
+
 pub struct MmsAligner {
     session: Session,
     vocab: HashMap<char, usize>,
@@ -13,9 +35,16 @@ pub struct MmsAligner {
 }
 
 impl MmsAligner {
-    pub fn load(model_path: &Path, vocab_path: Option<&Path>, verbose: bool) -> Result<Self, String> {
+    pub fn load(
+        model_path: &Path,
+        vocab_path: Option<&Path>,
+        verbose: bool,
+    ) -> Result<Self, String> {
         if verbose {
-            eprintln!("[info] Loading MMS-Align ONNX model from: {}", model_path.display());
+            eprintln!(
+                "[info] Loading MMS-Align ONNX model from: {}",
+                model_path.display()
+            );
         }
 
         let session = Session::builder()
@@ -27,21 +56,19 @@ impl MmsAligner {
             .commit_from_file(model_path)
             .map_err(|e| format!("Failed to load MMS-Align session: {e}"))?;
 
-        let (vocab, blank_id) = if let Some(v_path) = vocab_path {
-            if v_path.exists() {
-                load_vocab_json(v_path)?
-            } else {
-                default_mms_vocab()
-            }
-        } else {
-            // Check if vocab.json exists beside model_path
-            let sibling_vocab = model_path.with_file_name("vocab.json");
-            if sibling_vocab.exists() {
-                load_vocab_json(&sibling_vocab)?
-            } else {
-                default_mms_vocab()
-            }
-        };
+        let resolved_vocab_path = resolve_vocab_path(model_path, vocab_path).ok_or_else(|| {
+            format!(
+                "MMS-Align requires the vocab.json shipped with its forced-alignment model; no matching vocabulary was found for {}",
+                model_path.display(),
+            )
+        })?;
+        if verbose {
+            eprintln!(
+                "[info] Loading MMS-Align vocabulary from: {}",
+                resolved_vocab_path.display(),
+            );
+        }
+        let (vocab, blank_id) = load_vocab_json(&resolved_vocab_path)?;
 
         Ok(Self {
             session,
@@ -63,59 +90,136 @@ impl MmsAligner {
             return Ok(Vec::new());
         }
 
-        let duration_s = samples.len() as f64 / 16000.0;
-        // Wav2Vec2/MMS self-attention has O(N^2) memory complexity across 24 Transformer layers.
-        // Full unchunked inference on long audio (>60s) causes extreme memory explosion (tens of GBs)
-        // and CPU lockup. Safe single-pass limit is 60s; beyond that, use proportional alignment.
-        if duration_s > 60.0 {
-            if verbose {
-                eprintln!("[warn] Audio duration ({:.1}s) exceeds safe single-pass limit (60s) for MMS-Align; falling back to proportional alignment to avoid memory exhaustion.", duration_s);
-            }
-            return Ok(fallback_proportional_alignment(clean_text, duration_s));
-        }
-
-        if verbose {
-            eprintln!("[info] Running MMS-Align forward pass on {} samples ({:.2}s)...", 
-                samples.len(), duration_s);
-        }
-
-        // 1. Prepare input tensor: [1, num_samples]
-        let input_tensor = Tensor::from_array(([1, samples.len()], samples.to_vec()))
-            .map_err(|e| format!("Failed to create input tensor: {e}"))?;
-
-        let outputs = self.session.run(ort::inputs!["input_values" => input_tensor])
-            .map_err(|e| format!("MMS-Align inference failed: {e}"))?;
-
-        let (_name, tensor) = outputs.iter().next()
-            .ok_or_else(|| "No output tensor from MMS-Align model".to_string())?;
-
-        // Extract logits: [1, num_frames, vocab_size]
-        let (shape, logits_data) = tensor.try_extract_tensor::<f32>()
-            .map_err(|e| format!("Failed to extract logits tensor: {e}"))?;
-
-        if shape.len() != 3 {
-            return Err(format!("Expected 3D logits [1, frames, vocab], got {:?}", shape));
-        }
-
-        let num_frames = shape[1] as usize;
-        let vocab_size = shape[2] as usize;
-
-        if verbose {
-            eprintln!("[info] Computed logits: {} frames, {} vocab size", num_frames, vocab_size);
-        }
-
-        // 2. Perform CTC Trellis Alignment
-        let words = align_tokens_with_trellis(
+        let frames = self.infer_chunked(samples, verbose)?;
+        align_tokens_with_trellis(
             clean_text,
-            logits_data,
-            num_frames,
-            vocab_size,
+            &frames.logits,
+            &frames.times_ms,
+            frames.vocab_size,
             &self.vocab,
             self.blank_id,
             verbose,
-        )?;
+        )
+    }
 
-        Ok(words)
+    fn infer_chunked(&mut self, samples: &[f32], verbose: bool) -> Result<AcousticFrames, String> {
+        let step_samples = INFERENCE_CHUNK_SAMPLES - INFERENCE_OVERLAP_SAMPLES;
+        let total_chunks = samples.len().saturating_sub(1) / step_samples + 1;
+        let mut logits = Vec::new();
+        let mut times_ms = Vec::new();
+        let mut expected_vocab_size = None;
+        let mut chunk_start = 0;
+        let mut chunk_index = 0;
+
+        while chunk_start < samples.len() {
+            let chunk_end = (chunk_start + INFERENCE_CHUNK_SAMPLES).min(samples.len());
+            let chunk = &samples[chunk_start..chunk_end];
+            if verbose {
+                eprintln!(
+                    "[progress] alignment: {}",
+                    (chunk_index * 100 / total_chunks).min(99),
+                );
+                eprintln!(
+                    "[info] MMS-Align acoustic chunk {}/{}: {:.2}s to {:.2}s",
+                    chunk_index + 1,
+                    total_chunks,
+                    chunk_start as f64 / SAMPLE_RATE as f64,
+                    chunk_end as f64 / SAMPLE_RATE as f64,
+                );
+            }
+
+            let input_tensor = Tensor::from_array(([1, chunk.len()], chunk.to_vec()))
+                .map_err(|e| format!("Failed to create input tensor: {e}"))?;
+            let outputs = self
+                .session
+                .run(ort::inputs!["input_values" => input_tensor])
+                .map_err(|e| format!("MMS-Align inference failed: {e}"))?;
+            let (_name, tensor) = outputs
+                .iter()
+                .next()
+                .ok_or_else(|| "No output tensor from MMS-Align model".to_string())?;
+            let (shape, chunk_logits) = tensor
+                .try_extract_tensor::<f32>()
+                .map_err(|e| format!("Failed to extract logits tensor: {e}"))?;
+            if shape.len() != 3 {
+                return Err(format!(
+                    "Expected 3D logits [1, frames, vocab], got {:?}",
+                    shape
+                ));
+            }
+            let frame_count = shape[1] as usize;
+            let vocab_size = shape[2] as usize;
+            if frame_count == 0 || vocab_size == 0 {
+                return Err("MMS-Align returned an empty acoustic chunk".to_string());
+            }
+            if let Some(expected) = expected_vocab_size {
+                if expected != vocab_size {
+                    return Err(format!(
+                        "MMS-Align vocabulary changed between chunks: {expected} then {vocab_size}",
+                    ));
+                }
+            } else {
+                expected_vocab_size = Some(vocab_size);
+                let largest_token_id = self
+                    .vocab
+                    .values()
+                    .copied()
+                    .chain(std::iter::once(self.blank_id))
+                    .max()
+                    .unwrap_or(0);
+                if largest_token_id + 1 != vocab_size {
+                    return Err(format!(
+                        "MMS-Align model exposes {vocab_size} output labels, but its vocabulary defines {} labels; the model and vocab.json do not match",
+                        largest_token_id + 1,
+                    ));
+                }
+            }
+
+            let half_overlap = INFERENCE_OVERLAP_SAMPLES / 2;
+            let owned_start = if chunk_start == 0 {
+                0
+            } else {
+                chunk_start + half_overlap
+            };
+            let owned_end = if chunk_end == samples.len() {
+                samples.len()
+            } else {
+                chunk_end - half_overlap
+            };
+            for frame in 0..frame_count {
+                let center_in_chunk = ((2 * frame + 1) * chunk.len()) / (2 * frame_count);
+                let center_sample = chunk_start + center_in_chunk;
+                if center_sample < owned_start || center_sample >= owned_end {
+                    continue;
+                }
+                let row_start = frame * vocab_size;
+                logits.extend_from_slice(&chunk_logits[row_start..row_start + vocab_size]);
+                times_ms.push((center_sample * 1000 / SAMPLE_RATE) as i64);
+            }
+
+            if chunk_end == samples.len() {
+                break;
+            }
+            chunk_start += step_samples;
+            chunk_index += 1;
+        }
+
+        if times_ms.is_empty() {
+            return Err("MMS-Align produced no usable acoustic frames".to_string());
+        }
+        if verbose {
+            eprintln!("[progress] alignment: 100");
+            eprintln!(
+                "[info] MMS-Align produced {} global acoustic frames from {} chunks",
+                times_ms.len(),
+                total_chunks,
+            );
+        }
+        Ok(AcousticFrames {
+            logits,
+            times_ms,
+            vocab_size: expected_vocab_size.unwrap_or(0),
+        })
     }
 }
 
@@ -123,24 +227,31 @@ impl MmsAligner {
 fn align_tokens_with_trellis(
     transcript: &str,
     logits: &[f32],
-    num_frames: usize,
+    frame_times_ms: &[i64],
     vocab_size: usize,
     vocab: &HashMap<char, usize>,
     blank_id: usize,
     verbose: bool,
 ) -> Result<Vec<AlignedWord>, String> {
-    // 1. Parse transcript into words and target characters
+    let num_frames = frame_times_ms.len();
+    if logits.len() != num_frames * vocab_size {
+        return Err("Acoustic logits and frame timestamps have inconsistent sizes".to_string());
+    }
     let raw_words: Vec<&str> = transcript.split_whitespace().collect();
     if raw_words.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut target_tokens: Vec<(usize, char, usize)> = Vec::new(); // (word_idx, char, token_id)
+    let mut target_tokens = Vec::new();
     for (w_idx, w) in raw_words.iter().enumerate() {
         for c in w.chars() {
             let lower = c.to_lowercase().next().unwrap_or(c);
-            let token_id = vocab.get(&lower).copied().unwrap_or(blank_id);
-            target_tokens.push((w_idx, c, token_id));
+            if let Some(&token_id) = vocab.get(&lower) {
+                target_tokens.push(TranscriptToken {
+                    word_index: w_idx,
+                    token_id,
+                });
+            }
         }
     }
 
@@ -149,12 +260,13 @@ fn align_tokens_with_trellis(
     }
 
     let num_tokens = target_tokens.len();
+    let state_count = num_tokens * 2 + 1;
+    let final_token_state = state_count - 2;
+    let final_blank_state = state_count - 1;
     if num_frames < num_tokens {
-        // Fallback: If audio frames are fewer than tokens, use uniform spacing
-        if verbose {
-            eprintln!("[warn] Audio frames ({}) fewer than tokens ({}); using proportional fallback", num_frames, num_tokens);
-        }
-        return Ok(fallback_proportional_alignment(transcript, num_frames as f64 * 0.02));
+        return Err(format!(
+            "MMS-Align has fewer acoustic frames ({num_frames}) than transcript tokens ({num_tokens})",
+        ));
     }
 
     // 2. Precompute Log-Sum-Exp once per frame: O(num_frames * vocab_size)
@@ -169,74 +281,168 @@ fn align_tokens_with_trellis(
         log_sum_exps.push(max_val + sum_exp.ln());
     }
 
-    // Direct O(1) log_prob evaluation
-    let get_log_prob = |t: usize, token_id: usize| -> f32 {
-        logits[t * vocab_size + token_id] - log_sum_exps[t]
+    let get_log_prob =
+        |t: usize, token_id: usize| -> f32 { logits[t * vocab_size + token_id] - log_sum_exps[t] };
+
+    let label_for_state = |state: usize| -> usize {
+        if state.is_multiple_of(2) {
+            blank_id
+        } else {
+            target_tokens[(state - 1) / 2].token_id
+        }
     };
+    let mut previous_states = vec![0usize];
+    let mut previous_scores = vec![0.0f32];
+    let mut traces = Vec::with_capacity(num_frames);
+    let mut candidate_scores = vec![neg_inf; state_count];
+    let mut candidate_offsets = vec![u8::MAX; state_count];
+    let mut touched_states = Vec::with_capacity(ALIGNMENT_BEAM_STATES * 3);
 
-    let mut trellis = vec![neg_inf; num_frames * num_tokens];
+    for frame in 0..num_frames {
+        let remaining_frames = num_frames - frame - 1;
+        let minimum_completable_state = final_token_state.saturating_sub(remaining_frames * 2);
+        for (&previous_state, &previous_score) in
+            previous_states.iter().zip(previous_scores.iter())
+        {
+            for offset in 0..=2usize {
+                let state = previous_state + offset;
+                if state >= state_count || state < minimum_completable_state {
+                    continue;
+                }
+                if offset == 2 {
+                    if state.is_multiple_of(2) {
+                        continue;
+                    }
+                    let token_index = (state - 1) / 2;
+                    if target_tokens[token_index].token_id
+                        == target_tokens[token_index - 1].token_id
+                    {
+                        continue;
+                    }
+                }
+                let score = previous_score + get_log_prob(frame, label_for_state(state));
+                if candidate_offsets[state] == u8::MAX {
+                    touched_states.push(state);
+                }
+                if score > candidate_scores[state] {
+                    candidate_scores[state] = score;
+                    candidate_offsets[state] = offset as u8;
+                }
+            }
+        }
 
-    // Initialize t=0
-    let first_token_id = target_tokens[0].2;
-    trellis[0] = get_log_prob(0, first_token_id);
+        if touched_states.is_empty() {
+            return Err(format!(
+                "MMS-Align lost every CTC path at acoustic frame {frame}"
+            ));
+        }
+        let all_touched_states = touched_states.clone();
+        touched_states.sort_unstable_by(|left, right| {
+            candidate_scores[*right].total_cmp(&candidate_scores[*left])
+        });
+        touched_states.truncate(ALIGNMENT_BEAM_STATES);
+        touched_states.sort_unstable();
 
-    // Forward Trellis
-    for t in 1..num_frames {
-        let blank_prob = get_log_prob(t, blank_id);
+        previous_states.clear();
+        previous_scores.clear();
+        let mut retained_offsets = Vec::with_capacity(touched_states.len());
+        for &state in &touched_states {
+            previous_states.push(state);
+            previous_scores.push(candidate_scores[state]);
+            retained_offsets.push(candidate_offsets[state]);
+        }
+        traces.push(TraceFrame {
+            states: previous_states
+                .iter()
+                .map(|state| *state as u32)
+                .collect(),
+            previous_offsets: retained_offsets,
+        });
 
-        for j in 0..num_tokens.min(t + 1) {
-            let token_id = target_tokens[j].2;
-            let emit_prob = get_log_prob(t, token_id);
-
-            // Path 1: stay on token j (consume blank or same)
-            let prev_same = trellis[(t - 1) * num_tokens + j] + blank_prob;
-
-            // Path 2: transition from token j-1
-            let prev_trans = if j > 0 {
-                trellis[(t - 1) * num_tokens + (j - 1)] + emit_prob
-            } else {
-                neg_inf
-            };
-
-            trellis[t * num_tokens + j] = prev_same.max(prev_trans);
+        touched_states.clear();
+        for state in all_touched_states {
+            candidate_scores[state] = neg_inf;
+            candidate_offsets[state] = u8::MAX;
         }
     }
 
-    // 3. Backtracking: from (num_frames - 1, num_tokens - 1) down to (0, 0)
-    let mut path = Vec::with_capacity(num_tokens);
-    let mut curr_t = num_frames - 1;
-    let mut curr_j = num_tokens - 1;
-
-    while curr_j > 0 && curr_t > 0 {
-        path.push((curr_t, curr_j));
-        let prev_same = trellis[(curr_t - 1) * num_tokens + curr_j];
-        let prev_trans = trellis[(curr_t - 1) * num_tokens + (curr_j - 1)];
-
-        if prev_trans >= prev_same {
-            curr_j -= 1;
-        }
-        curr_t -= 1;
+    let final_score = |state: usize| -> f32 {
+        previous_states
+            .binary_search(&state)
+            .ok()
+            .map(|index| previous_scores[index])
+            .unwrap_or(neg_inf)
+    };
+    let mut state = if final_score(final_blank_state) >= final_score(final_token_state) {
+        final_blank_state
+    } else {
+        final_token_state
+    };
+    if final_score(state) <= neg_inf / 2.0 {
+        return Err(format!(
+            "MMS-Align could not match the complete transcript within a {}-state acoustic beam",
+            ALIGNMENT_BEAM_STATES,
+        ));
     }
-    path.push((curr_t, 0));
-    path.reverse();
 
-    // 4. Group into word boundaries
-    // Each frame = 20ms (downsample factor 320 at 16kHz)
-    let frame_duration_ms = 20.0f64;
+    let mut token_spans: Vec<Option<(usize, usize, f64, usize)>> = vec![None; num_tokens];
+    for frame in (0..num_frames).rev() {
+        if !state.is_multiple_of(2) {
+            let token_index = (state - 1) / 2;
+            let probability = get_log_prob(frame, target_tokens[token_index].token_id).exp() as f64;
+            let span = token_spans[token_index].get_or_insert((frame, frame, 0.0, 0));
+            span.0 = span.0.min(frame);
+            span.1 = span.1.max(frame);
+            span.2 += probability;
+            span.3 += 1;
+        }
+        let trace = &traces[frame];
+        let state_index = trace
+            .states
+            .binary_search(&(state as u32))
+            .map_err(|_| "MMS-Align backtracking left the retained acoustic beam".to_string())?;
+        let offset = trace.previous_offsets[state_index];
+        if offset == u8::MAX || offset as usize > state {
+            return Err("MMS-Align encountered an invalid CTC backpointer".to_string());
+        }
+        state -= offset as usize;
+    }
+    if state != 0 {
+        return Err("MMS-Align backtracking did not return to the initial blank state".to_string());
+    }
 
-    let mut word_spans: HashMap<usize, (usize, usize)> = HashMap::new(); // word_idx -> (min_frame, max_frame)
-    for (t, j) in path {
-        let (word_idx, _, _) = target_tokens[j];
-        let entry = word_spans.entry(word_idx).or_insert((t, t));
-        entry.0 = entry.0.min(t);
-        entry.1 = entry.1.max(t);
+    let default_frame_ms = frame_times_ms
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .find(|duration| *duration > 0)
+        .unwrap_or(20);
+    let mut word_spans: HashMap<usize, (usize, usize, f64, usize)> = HashMap::new();
+    for (token_index, span) in token_spans.into_iter().enumerate() {
+        let Some((start_frame, end_frame, score_sum, score_count)) = span else {
+            return Err(format!(
+                "MMS-Align did not emit transcript token {token_index}"
+            ));
+        };
+        let word_index = target_tokens[token_index].word_index;
+        let entry = word_spans
+            .entry(word_index)
+            .or_insert((start_frame, end_frame, 0.0, 0));
+        entry.0 = entry.0.min(start_frame);
+        entry.1 = entry.1.max(end_frame);
+        entry.2 += score_sum;
+        entry.3 += score_count;
     }
 
     let mut aligned_words = Vec::new();
     for (w_idx, &word_str) in raw_words.iter().enumerate() {
-        let (min_f, max_f) = word_spans.get(&w_idx).copied().unwrap_or((0, 0));
-        let start_ms = (min_f as f64 * frame_duration_ms).round() as i64;
-        let end_ms = ((max_f + 1) as f64 * frame_duration_ms).round() as i64;
+        let Some((min_f, max_f, score_sum, score_count)) = word_spans.get(&w_idx).copied() else {
+            continue;
+        };
+        let start_ms = frame_times_ms[min_f];
+        let end_ms = frame_times_ms
+            .get(max_f + 1)
+            .copied()
+            .unwrap_or(frame_times_ms[max_f] + default_frame_ms);
 
         aligned_words.push(AlignedWord {
             word: word_str.to_string(),
@@ -245,78 +451,58 @@ fn align_tokens_with_trellis(
             start_ms,
             end_ms: end_ms.max(start_ms + 100),
             speaker: 0,
-            score: Some(0.95),
+            score: Some((score_sum / score_count.max(1) as f64) as f32),
         });
     }
-
+    if verbose {
+        eprintln!(
+            "[info] CTC forced alignment matched {} words across {} acoustic frames",
+            aligned_words.len(),
+            num_frames,
+        );
+    }
     Ok(aligned_words)
 }
 
-/// Fallback proportional alignment when CTC cannot be run or model is missing.
-pub fn fallback_proportional_alignment(transcript: &str, duration_seconds: f64) -> Vec<AlignedWord> {
-    let raw_words: Vec<&str> = transcript.split_whitespace().collect();
-    if raw_words.is_empty() {
-        return Vec::new();
+fn resolve_vocab_path(model_path: &Path, explicit_path: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = explicit_path {
+        return path.is_file().then(|| path.to_path_buf());
     }
 
-    let total_chars: usize = raw_words.iter().map(|w| w.chars().count().max(1)).sum();
-    let total_ms = (duration_seconds * 1000.0).max(1000.0) as i64;
-
-    let mut current_ms = 0i64;
-    let mut result = Vec::new();
-
-    for w in raw_words {
-        let c_len = w.chars().count().max(1);
-        let word_duration_ms = ((c_len as f64 / total_chars as f64) * total_ms as f64).round() as i64;
-        let start_ms = current_ms;
-        let end_ms = (current_ms + word_duration_ms).min(total_ms);
-
-        result.push(AlignedWord {
-            word: w.to_string(),
-            start: start_ms as f64 / 1000.0,
-            end: end_ms as f64 / 1000.0,
-            start_ms,
-            end_ms: end_ms.max(start_ms + 60),
-            speaker: 0,
-            score: None,
-        });
-
-        current_ms = end_ms;
+    let sibling = model_path.with_file_name("vocab.json");
+    if sibling.is_file() {
+        return Some(sibling);
     }
 
-    result
+    let parent_sibling = model_path.parent()?.parent()?.join("vocab.json");
+    parent_sibling.is_file().then_some(parent_sibling)
+}
+
+fn parse_vocab_json(content: &str) -> Result<(HashMap<char, usize>, usize), String> {
+    let raw: HashMap<String, usize> =
+        serde_json::from_str(content).map_err(|e| format!("Failed to parse vocab JSON: {e}"))?;
+    let blank_id = raw
+        .get("<blank>")
+        .or_else(|| raw.get("[blank]"))
+        .copied()
+        .ok_or_else(|| "Forced-alignment vocabulary does not define <blank>".to_string())?;
+
+    let vocab = raw
+        .into_iter()
+        .filter_map(|(label, token_id)| {
+            let mut characters = label.chars();
+            let character = characters.next()?;
+            characters.next().is_none().then_some((character, token_id))
+        })
+        .collect();
+
+    Ok((vocab, blank_id))
 }
 
 fn load_vocab_json(path: &Path) -> Result<(HashMap<char, usize>, usize), String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read vocab file {}: {e}", path.display()))?;
-    let raw: HashMap<String, usize> = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse vocab JSON: {e}"))?;
-
-    let mut vocab = HashMap::new();
-    let mut blank_id = 0;
-
-    for (k, v) in raw {
-        if k == "<pad>" || k == "[pad]" || k == "<blank>" {
-            blank_id = v;
-        } else if let Some(c) = k.chars().next() {
-            vocab.insert(c, v);
-        }
-    }
-
-    Ok((vocab, blank_id))
-}
-
-fn default_mms_vocab() -> (HashMap<char, usize>, usize) {
-    let mut vocab = HashMap::new();
-    // Default Wav2Vec2/MMS English mapping: 0 = pad, 1-26 = a-z, 27 = ' ' or '|'
-    let letters = "abcdefghijklmnopqrstuvwxyz";
-    for (i, c) in letters.chars().enumerate() {
-        vocab.insert(c, i + 1);
-    }
-    vocab.insert('|', 27);
-    vocab.insert('\'', 28);
-    (vocab, 0)
+    parse_vocab_json(&content)
 }
 
 /// Resolves default path for MMS-Align ONNX model.
@@ -327,4 +513,61 @@ pub fn default_mms_model_path() -> PathBuf {
         .join("models")
         .join("mms-align")
         .join("model.onnx")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctc_alignment_follows_acoustic_peaks_instead_of_text_proportion() {
+        let num_frames = 12;
+        let vocab_size = 3;
+        let mut logits = vec![-5.0; num_frames * vocab_size];
+        for frame in 0..num_frames {
+            logits[frame * vocab_size] = 5.0;
+        }
+        logits[2 * vocab_size] = -5.0;
+        logits[2 * vocab_size + 1] = 10.0;
+        logits[8 * vocab_size] = -5.0;
+        logits[8 * vocab_size + 2] = 10.0;
+
+        let vocab = HashMap::from([('a', 1), ('b', 2)]);
+        let frame_times_ms: Vec<i64> = (0..num_frames).map(|frame| frame as i64 * 20).collect();
+        let words = align_tokens_with_trellis(
+            "a b",
+            &logits,
+            &frame_times_ms,
+            vocab_size,
+            &vocab,
+            0,
+            false,
+        )
+        .expect("alignment should succeed");
+
+        assert_eq!(words[0].start_ms, 40);
+        assert_eq!(words[1].start_ms, 160);
+    }
+
+    #[test]
+    fn forced_alignment_vocab_uses_blank_instead_of_pad() {
+        let (vocab, blank_id) = parse_vocab_json(
+            r#"{
+                "<blank>": 0,
+                "<pad>": 1,
+                "</s>": 2,
+                "<unk>": 3,
+                "a": 4,
+                "z": 26,
+                "'": 28
+            }"#,
+        )
+        .expect("forced-alignment vocabulary should parse");
+
+        assert_eq!(blank_id, 0);
+        assert_eq!(vocab.get(&'a'), Some(&4));
+        assert_eq!(vocab.get(&'z'), Some(&26));
+        assert_eq!(vocab.get(&'\''), Some(&28));
+        assert!(!vocab.contains_key(&'<'));
+    }
 }

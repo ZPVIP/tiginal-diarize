@@ -121,7 +121,11 @@ fn main() -> ExitCode {
 
     let audio_duration_s = samples.len() as f64 / audio::SAMPLE_RATE as f64;
     if args.verbose {
-        eprintln!("[info] Audio duration: {:.2}s ({:.2} minutes)", audio_duration_s, audio_duration_s / 60.0);
+        eprintln!(
+            "[info] Audio duration: {:.2}s ({:.2} minutes)",
+            audio_duration_s,
+            audio_duration_s / 60.0
+        );
     }
 
     // 3. Run speaker diarization pipeline (Nemotron-3)
@@ -143,7 +147,9 @@ fn main() -> ExitCode {
     let mut aligned_words: Option<Vec<export::AlignedWord>> = None;
 
     if args.transcribe {
-        let w_model_path = args.whisper_model.unwrap_or_else(whisper::default_whisper_model_path);
+        let w_model_path = args
+            .whisper_model
+            .unwrap_or_else(whisper::default_whisper_model_path);
         let transcriber = whisper::WhisperTranscriber::new(&w_model_path, args.language.clone());
         match transcriber.transcribe(&samples, args.verbose) {
             Ok((txt, words)) => {
@@ -159,38 +165,41 @@ fn main() -> ExitCode {
         match std::fs::read_to_string(trans_path) {
             Ok(content) => {
                 let clean_text = content.trim().to_string();
-                let mms_path = args.align_model.unwrap_or_else(align::default_mms_model_path);
+                let mms_path = args
+                    .align_model
+                    .unwrap_or_else(align::default_mms_model_path);
 
                 if mms_path.exists() {
                     match align::MmsAligner::load(&mms_path, None, args.verbose) {
-                        Ok(mut aligner) => match aligner.align(&samples, &clean_text, args.verbose) {
+                        Ok(mut aligner) => match aligner.align(&samples, &clean_text, args.verbose)
+                        {
                             Ok(words) => {
                                 aligned_words = Some(words);
                             }
                             Err(e) => {
-                                if args.verbose {
-                                    eprintln!("[warn] MMS-Align alignment failed: {e}; using fallback");
-                                }
-                                aligned_words = Some(align::fallback_proportional_alignment(&clean_text, audio_duration_s));
+                                eprintln!("[error] MMS-Align alignment failed: {e}");
+                                return ExitCode::from(4);
                             }
                         },
                         Err(e) => {
-                            if args.verbose {
-                                eprintln!("[warn] Failed to load MMS-Align model: {e}; using fallback");
-                            }
-                            aligned_words = Some(align::fallback_proportional_alignment(&clean_text, audio_duration_s));
+                            eprintln!("[error] Failed to load MMS-Align model: {e}");
+                            return ExitCode::from(4);
                         }
                     }
                 } else {
-                    if args.verbose {
-                        eprintln!("[info] MMS-Align model not found at {}; using proportional fallback", mms_path.display());
-                    }
-                    aligned_words = Some(align::fallback_proportional_alignment(&clean_text, audio_duration_s));
+                    eprintln!(
+                        "[error] MMS-Align model not found at {}",
+                        mms_path.display()
+                    );
+                    return ExitCode::from(4);
                 }
                 transcript_text = Some(clean_text);
             }
             Err(err) => {
-                eprintln!("[error] Failed to read transcript file {}: {err}", trans_path.display());
+                eprintln!(
+                    "[error] Failed to read transcript file {}: {err}",
+                    trans_path.display()
+                );
                 return ExitCode::from(4);
             }
         }
@@ -256,8 +265,7 @@ fn main() -> ExitCode {
             .map_err(|e| format!("Failed to serialize full JSON: {e}"))
     } else {
         // Pure diarization mode: output turns directly for backward compatibility
-        serde_json::to_string_pretty(&turns)
-            .map_err(|e| format!("Failed to serialize JSON: {e}"))
+        serde_json::to_string_pretty(&turns).map_err(|e| format!("Failed to serialize JSON: {e}"))
     };
 
     let output_str = match json_output {
@@ -270,7 +278,10 @@ fn main() -> ExitCode {
 
     if let Some(out_path) = args.output {
         if let Err(err) = write_output_file(&out_path, &output_str) {
-            eprintln!("[error] Failed writing output file {}: {err}", out_path.display());
+            eprintln!(
+                "[error] Failed writing output file {}: {err}",
+                out_path.display()
+            );
             return ExitCode::from(6);
         }
         if args.verbose {
