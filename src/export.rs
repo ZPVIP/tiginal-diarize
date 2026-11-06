@@ -116,7 +116,59 @@ pub fn ends_sentence(text: &str) -> bool {
         .ends_with(['.', '?', '!', '…', '。', '？', '！'])
 }
 
-/// Assigns words to speaker turns using sentence-level boundaries and maximum time overlap.
+/// Longest run of words without any punctuation seen in punctuated meeting transcripts is ~55; Whisper dropouts run for hundreds or thousands.
+const UNPUNCTUATED_STRETCH_WORDS: usize = 60;
+
+/// Whisper word timestamps drift by a few hundred milliseconds, so a voice heard for less than this is boundary jitter, not a turn.
+const MIN_VOICE_MS: i64 = 1000;
+
+fn is_punctuated(word: &str) -> bool {
+    word.contains([
+        ',', '.', '?', '!', ';', ':', '…', '，', '。', '？', '！', '、', '；', '：',
+    ])
+}
+
+/// Flags each word inside a run of more than `UNPUNCTUATED_STRETCH_WORDS` words without punctuation, where the transcriber stopped punctuating.
+fn unpunctuated_stretches(words: &[AlignedWord]) -> Vec<bool> {
+    let mut flags = vec![false; words.len()];
+    let mut start = 0;
+    for end in 0..=words.len() {
+        if end == words.len() || is_punctuated(&words[end].word) {
+            if end - start > UNPUNCTUATED_STRETCH_WORDS {
+                flags[start..end].fill(true);
+            }
+            start = end + 1;
+        }
+    }
+    flags
+}
+
+/// The speaker heard during each word, with voices shorter than `MIN_VOICE_MS` absorbed by the voice before them.
+fn word_voices(words: &[AlignedWord], turns: &[crate::diarize::Turn]) -> Vec<usize> {
+    let heard: Vec<usize> = words
+        .iter()
+        .map(|w| crate::diarize::speaker_at(turns, w.start_ms, w.end_ms))
+        .collect();
+    let mut voices = heard.clone();
+    let mut start = 0;
+    while start < heard.len() {
+        let end = (start..heard.len())
+            .find(|&i| heard[i] != heard[start])
+            .unwrap_or(heard.len());
+        if words[end - 1].end_ms - words[start].start_ms < MIN_VOICE_MS {
+            let neighbour = if start > 0 {
+                voices[start - 1]
+            } else {
+                heard.get(end).copied().unwrap_or(heard[start])
+            };
+            voices[start..end].fill(neighbour);
+        }
+        start = end;
+    }
+    voices
+}
+
+/// Groups words into speaker segments. A sentence is never split between speakers; where the transcriber stopped punctuating there are no sentences, so segments follow the voices instead.
 pub fn match_words_to_turns(
     words: &[AlignedWord],
     turns: &[crate::diarize::Turn],
@@ -131,24 +183,22 @@ pub fn match_words_to_turns(
         end_ms: i64,
     }
 
-    // Step 1: Initial cuts at sentence ends, speaker changes at pauses (>= 250ms), or long silences (>= 3000ms).
-    // A run of continuous speech without pause is NEVER cut in the middle.
+    let unpunctuated = unpunctuated_stretches(words);
+    let voices = word_voices(words, turns);
+
+    // Step 1: Cut at sentence ends, long silences (>= 3000ms), and voice changes inside unpunctuated stretches.
     let mut pieces: Vec<Phrase> = Vec::new();
-    for w in words {
+    for (i, w) in words.iter().enumerate() {
         let sentence_ended = pieces.last().is_some_and(|p| {
             p.words.last().is_some_and(|last| ends_sentence(&last.word))
         });
         let pause = pieces.last().map_or(0, |p| w.start_ms.saturating_sub(p.end_ms));
         let long_pause = pause >= 3000;
-        let turn_at_pause = !turns.is_empty()
-            && pieces.last().is_some_and(|p| {
-                pause >= 250
-                    && crate::diarize::speaker_at(turns, p.start_ms, p.end_ms)
-                        != crate::diarize::speaker_at(turns, w.start_ms, w.end_ms)
-            });
+        let voice_changed =
+            i > 0 && (unpunctuated[i - 1] || unpunctuated[i]) && voices[i] != voices[i - 1];
 
         match pieces.last_mut() {
-            Some(p) if !sentence_ended && !turn_at_pause && !long_pause => {
+            Some(p) if !sentence_ended && !long_pause && !voice_changed => {
                 p.end_ms = w.end_ms.max(p.end_ms);
                 p.words.push(w.clone());
             }
@@ -162,26 +212,7 @@ pub fn match_words_to_turns(
         }
     }
 
-    // Step 2: Sentence integrity protection:
-    // A sentence is NEVER split between speakers. If a piece stopped without a sentence-ending
-    // punctuation mark and the next piece follows within a normal pause (< 3000ms), join them.
-    let mut sentences: Vec<Phrase> = Vec::new();
-    for piece in pieces {
-        match sentences.last_mut() {
-            Some(previous)
-                if !ends_sentence(previous.words.last().map_or("", |w| &w.word))
-                    && piece.start_ms.saturating_sub(previous.end_ms) < 3000 =>
-            {
-                previous.end_ms = piece.end_ms.max(previous.end_ms);
-                previous.words.extend(piece.words);
-            }
-            _ => sentences.push(piece),
-        }
-    }
-    let pieces = sentences;
-
-    // Step 3: Assign speakers based on maximum time overlap over the whole sentence,
-    // align start time to takeover if speaker changed, and assemble into DiarizedSegments.
+    // Step 2: Assign each piece the speaker who overlaps it most, align its start to the takeover if the speaker changed, and assemble DiarizedSegments.
     let mut segments: Vec<DiarizedSegment> = Vec::new();
     for mut piece in pieces {
         let speaker = crate::diarize::speaker_at(turns, piece.start_ms, piece.end_ms);
@@ -395,6 +426,93 @@ mod tests {
         assert_eq!(segments[0].text, "Hello.");
         assert_eq!(segments[1].speaker, 1);
         assert_eq!(segments[1].text, "Hi there.");
+    }
+
+    fn spoken(text: &str, start_ms: i64, end_ms: i64) -> Vec<AlignedWord> {
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        let step = (end_ms - start_ms) / tokens.len() as i64;
+        tokens
+            .iter()
+            .enumerate()
+            .map(|(i, word)| {
+                let start_ms = start_ms + i as i64 * step;
+                let end_ms = start_ms + step - 20;
+                AlignedWord {
+                    word: word.to_string(),
+                    start: start_ms as f64 / 1000.0,
+                    end: end_ms as f64 / 1000.0,
+                    start_ms,
+                    end_ms,
+                    speaker: 0,
+                    score: None,
+                }
+            })
+            .collect()
+    }
+
+    fn turn(speaker: usize, start_ms: i64, end_ms: i64) -> Turn {
+        Turn {
+            speaker,
+            start: start_ms as f64 / 1000.0,
+            end: end_ms as f64 / 1000.0,
+            start_ms,
+            end_ms,
+        }
+    }
+
+    #[test]
+    fn test_sentence_cut_at_a_pause_stays_with_one_speaker() {
+        let words = [
+            spoken("So I think", 0, 900),
+            spoken("we should ship it on Friday.", 1200, 3000),
+        ]
+        .concat();
+        let turns = vec![turn(1, 0, 950), turn(0, 950, 3100)];
+
+        let segments = match_words_to_turns(&words, &turns);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].speaker, 0);
+        assert_eq!(segments[0].text, "So I think we should ship it on Friday.");
+    }
+
+    #[test]
+    fn test_unpunctuated_transcript_still_splits_at_speaker_changes() {
+        let lines = [
+            "here's what you get it rolls over from there if you want more great pay us more",
+            "yeah for example the memory in ipad they give the user twelve gigabytes but they sell only eight and disable the other four",
+            "yeah because we're talking about data retention on the device we're talking about single digit megabytes right now",
+            "and the storage is unlimited in the cloud so you can let them pay more if they want the data for years",
+        ];
+        let words = [
+            spoken(lines[0], 0, 5000),
+            spoken(lines[1], 5000, 12000),
+            spoken(lines[2], 12000, 17500),
+            spoken(lines[3], 17500, 24000),
+        ]
+        .concat();
+        let turns = vec![
+            turn(0, 0, 5000),
+            turn(1, 5000, 12000),
+            turn(0, 12000, 17500),
+            turn(1, 17500, 24000),
+        ];
+
+        let segments = match_words_to_turns(&words, &turns);
+        let speakers: Vec<usize> = segments.iter().map(|s| s.speaker).collect();
+        let texts: Vec<&str> = segments.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(speakers, vec![0, 1, 0, 1]);
+        assert_eq!(texts, lines);
+    }
+
+    #[test]
+    fn test_unpunctuated_voice_blip_stays_with_the_speaker() {
+        let text: Vec<String> = (0..70).map(|i| format!("w{i}")).collect();
+        let words = spoken(&text.join(" "), 0, 21000);
+        let turns = vec![turn(0, 0, 8000), turn(1, 8000, 8600), turn(0, 8600, 21000)];
+
+        let segments = match_words_to_turns(&words, &turns);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].speaker, 0);
     }
 
     #[test]
