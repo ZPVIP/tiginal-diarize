@@ -122,7 +122,7 @@ const UNPUNCTUATED_STRETCH_WORDS: usize = 60;
 /// Whisper word timestamps drift by a few hundred milliseconds, so a voice heard for less than this is boundary jitter, not a turn.
 const MIN_VOICE_MS: i64 = 1000;
 
-fn is_punctuated(word: &str) -> bool {
+pub(crate) fn is_punctuated(word: &str) -> bool {
     word.contains([
         ',', '.', '?', '!', ';', ':', '…', '，', '。', '？', '！', '、', '；', '：',
     ])
